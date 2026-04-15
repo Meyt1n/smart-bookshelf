@@ -1,0 +1,17 @@
+# 排除模型和大文件
+*.onnx
+*.dll
+*.exe
+*.zip
+*.db
+*.lock
+
+# 排除 IDE 缓存
+.idea/
+.vscode/
+AppData/
+venv/
+*.pyc
+
+# 排除 Piper 的数据目录
+tools/piper/piper/espeak-ng-data/

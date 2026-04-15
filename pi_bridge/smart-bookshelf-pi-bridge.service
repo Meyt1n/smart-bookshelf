@@ -1,0 +1,22 @@
+[Unit]
+Description=Smart Bookshelf Raspberry Pi Bridge
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/pi/smart_bookshelf/pi_bridge
+Environment=PI_BRIDGE_HOST=127.0.0.1
+Environment=PI_BRIDGE_PORT=8765
+Environment=PI_BRIDGE_BACKEND=smbus_i2c
+Environment=PI_BRIDGE_SLAVE_ADDR=0x30
+Environment=PI_BRIDGE_I2C_BUS=1
+Environment=PI_BRIDGE_LOG_PATH=/home/pi/smart_bookshelf/pi_bridge/runtime/bridge.log
+ExecStart=/usr/bin/python3 /home/pi/smart_bookshelf/pi_bridge/bridge_server.py
+Restart=always
+RestartSec=2
+User=pi
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

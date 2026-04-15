@@ -1,0 +1,12 @@
+numpy==1.26.4
+opencv-python
+thefuzz
+paddleocr==2.7.3
+ultralytics==8.3.225
+edge-tts
+vosk
+requests
+sounddevice
+playsound==1.2.2
+PyJWT
+qrcode[pil]
