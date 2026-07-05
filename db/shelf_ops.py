@@ -1,6 +1,6 @@
 import sqlite3
 
-DB_PATH = r"C:\Users\32140\Desktop\bookshelf-ziggy-client-auth\bookshelf-ziggy-client-auth\data\bookshelf.db"
+from config import DB_PATH
 
 
 def _clone_book_record(cur, book_id):

@@ -5,6 +5,7 @@ api/voice.py
 
 import base64
 import json as _json
+import sqlite3
 import threading
 import time
 
@@ -16,7 +17,7 @@ from ai.voice_module import (
     tts_to_mp3_bytes,
     tts_to_wav_bytes,
 )
-from ai.book_match_ai import chat_with_librarian
+from ai.book_match_ai import chat_with_librarian, trigger_action_chat
 from services.voice_intent import normalize_voice_text, has_wake_word, strip_wake_words
 from services.voice_service import (
     push_voice_event,
@@ -25,6 +26,7 @@ from services.voice_service import (
     build_voice_hints,
 )
 from services.shelf_service import store_from_image_bytes
+from config import DB_PATH
 
 voice_bp = Blueprint("voice", __name__)
 
@@ -41,6 +43,153 @@ def _shelf_result_payload(result):
         if value not in (None, "", False):
             payload[key] = value
     return payload
+
+
+def _build_tts_audio_payload(text):
+    reply = (text or "").strip()
+    if not reply:
+        return "", ""
+    try:
+        mp3_bytes = tts_to_mp3_bytes(reply)
+        if mp3_bytes:
+            return base64.b64encode(mp3_bytes).decode("ascii"), "mp3"
+        wav_bytes = tts_to_wav_bytes(reply)
+        if wav_bytes:
+            return base64.b64encode(wav_bytes).decode("ascii"), "wav"
+    except Exception as exc:
+        print("[voice tts payload error]", exc)
+    return "", ""
+
+
+def _attach_tts_audio(result):
+    payload = dict(result or {})
+    audio_b64, audio_format = _build_tts_audio_payload(payload.get("reply"))
+    payload["audio_b64"] = audio_b64
+    payload["audio_format"] = audio_format
+    return payload
+
+
+def _latest_borrow_log_id():
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        cur = conn.cursor()
+        cur.execute("SELECT COALESCE(MAX(id), 0) FROM borrow_logs")
+        latest = int(cur.fetchone()[0] or 0)
+        conn.close()
+        return latest
+    except Exception:
+        return 0
+
+
+def _borrow_log_events_after(last_id):
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        conn.row_factory = sqlite3.Row
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT l.id, l.action, l.compartment_id, b.title
+            FROM borrow_logs l
+            JOIN books b ON b.id = l.book_id
+            WHERE l.id > ?
+            ORDER BY l.id ASC
+            LIMIT 20
+            """,
+            (int(last_id or 0),),
+        )
+        rows = cur.fetchall()
+        conn.close()
+    except Exception:
+        return [], int(last_id or 0)
+
+    events = []
+    latest = int(last_id or 0)
+    for row in rows:
+        latest = max(latest, int(row["id"]))
+        action = row["action"]
+        action_text = "已存入" if action == "store" else "已取出"
+        title = row["title"] or "未知图书"
+        cid = row["compartment_id"]
+        suffix = f"（{cid}号格）" if cid is not None else ""
+        op_text = f"{action_text}《{title}》{suffix}"
+        try:
+            ai_reply = trigger_action_chat(action, title, speak_out=False)
+        except Exception as exc:
+            print("[shelf watch ai reply error]", exc)
+            ai_reply = op_text
+        events.append(
+            {
+                "role": "assistant",
+                "text": ai_reply or op_text,
+                "ts": time.time(),
+                "source": "shelf_watch",
+                "intent": action,
+                "action": action,
+                "title": title,
+                "cid": cid,
+                "op_text": op_text,
+                "log_id": int(row["id"]),
+            }
+        )
+    return events, latest
+
+
+@voice_bp.route("/api/camera/snapshot", methods=["GET"])
+def api_camera_snapshot():
+    try:
+        from ocr.video_ocr import encode_frame_as_jpeg, open_camera_capture
+
+        cap, frame = open_camera_capture()
+        if cap is None or frame is None:
+            return jsonify({"ok": False, "msg": "camera unavailable"}), 503
+        try:
+            image = encode_frame_as_jpeg(frame, quality=90)
+        finally:
+            cap.release()
+        return Response(
+            image,
+            mimetype="image/jpeg",
+            headers={"Cache-Control": "no-store"},
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "msg": f"camera snapshot failed: {exc}"}), 500
+
+
+@voice_bp.route("/api/camera/stream", methods=["GET"])
+def api_camera_stream():
+    fps = max(1, min(int(request.args.get("fps", 8)), 20))
+    delay = 1.0 / fps
+
+    def generate():
+        from ocr.video_ocr import encode_frame_as_jpeg, open_camera_capture
+
+        cap, frame = open_camera_capture()
+        if cap is None:
+            return
+
+        try:
+            while True:
+                if frame is None:
+                    ret, frame = cap.read()
+                    if not ret or frame is None:
+                        break
+
+                image = encode_frame_as_jpeg(frame, quality=82)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n"
+                    b"Cache-Control: no-store\r\n\r\n" + image + b"\r\n"
+                )
+                frame = None
+                time.sleep(delay)
+        finally:
+            cap.release()
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="multipart/x-mixed-replace; boundary=frame",
+        headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+    )
 
 
 @voice_bp.route("/api/voice_chat", methods=["POST"])
@@ -87,15 +236,7 @@ def api_ocr_ingest():
         audio_b64 = ""
         audio_format = ""
         if want_audio and reply:
-            mp3_bytes = tts_to_mp3_bytes(reply)
-            if mp3_bytes:
-                audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-                audio_format = "mp3"
-            else:
-                wav_bytes = tts_to_wav_bytes(reply)
-                if wav_bytes:
-                    audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-                    audio_format = "wav"
+            audio_b64, audio_format = _build_tts_audio_payload(reply)
 
         return jsonify(
             {
@@ -199,24 +340,6 @@ def api_voice_ingest():
     if mode == "command" or wake_hit:
         print(f"[voice ingest] mode={mode or 'wake'} text={text} wake_hit={wake_hit}")
 
-    def attach_audio(result):
-        reply = (result.get("reply") or "").strip()
-        audio_b64 = ""
-        audio_format = ""
-        if reply:
-            mp3_bytes = tts_to_mp3_bytes(reply)
-            if mp3_bytes:
-                audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-                audio_format = "mp3"
-            else:
-                wav_bytes = tts_to_wav_bytes(reply)
-                if wav_bytes:
-                    audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-                    audio_format = "wav"
-        result["audio_b64"] = audio_b64
-        result["audio_format"] = audio_format
-        return result
-
     if mode != "command":
         if not wake_hit:
             return jsonify({"ok": True, "ignore": True, "wake": False}), 200
@@ -233,7 +356,7 @@ def api_voice_ingest():
             "text": "",
             "reply": reply_text,
         }
-        return jsonify(attach_audio(result))
+        return jsonify(_attach_tts_audio(result))
     else:
         stripped = strip_wake_words(text)
         if not stripped and wake_hit:
@@ -247,10 +370,15 @@ def api_voice_ingest():
                 "text": text,
                 "reply": reply_text,
             }
-            return jsonify(attach_audio(result))
+            return jsonify(_attach_tts_audio(result))
         if not stripped:
             stripped = text
-        result = route_text(stripped, image_bytes=image, push_events=push_events)
+        try:
+            result = route_text(stripped, image_bytes=image, push_events=push_events)
+        except Exception as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            print("[voice ingest route error]", detail)
+            return jsonify({"ok": False, "msg": f"voice route error: {detail}"}), 500
         result["wake"] = wake_hit
         result["text"] = stripped
 
@@ -258,7 +386,7 @@ def api_voice_ingest():
         result["ok"] = True
         result["reply"] = "\u597d\u7684\uff0c\u8bf7\u5bf9\u51c6\u4e66\u810a\uff0c\u6211\u6765\u626b\u63cf\u3002"
 
-    return jsonify(attach_audio(result))
+    return jsonify(_attach_tts_audio(result))
 
 
 @voice_bp.route("/api/voice_events", methods=["GET"])
@@ -273,6 +401,7 @@ def api_voice_stream():
 
     def generate():
         last_idx = 0
+        last_borrow_log_id = _latest_borrow_log_id()
         # 先推一条心跳，让浏览器确认连接成功
         yield 'data: {"type":"connected"}\n\n'
         while True:
@@ -281,6 +410,9 @@ def api_voice_stream():
                 last_idx = len(events)
                 for ev in new_events:
                     yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
+            shelf_events, last_borrow_log_id = _borrow_log_events_after(last_borrow_log_id)
+            for ev in shelf_events:
+                yield f"data: {_json.dumps(ev, ensure_ascii=False)}\n\n"
             time.sleep(0.2)   # 200ms 检查一次
 
     return Response(
@@ -299,15 +431,5 @@ def api_tts_say():
     text = (data.get("text") or "").strip()
     if not text:
         return jsonify({"ok": False, "msg": "empty text"}), 400
-    audio_b64 = ""
-    audio_format = ""
-    mp3_bytes = tts_to_mp3_bytes(text)
-    if mp3_bytes:
-        audio_b64 = base64.b64encode(mp3_bytes).decode("ascii")
-        audio_format = "mp3"
-    else:
-        wav_bytes = tts_to_wav_bytes(text)
-        if wav_bytes:
-            audio_b64 = base64.b64encode(wav_bytes).decode("ascii")
-            audio_format = "wav"
+    audio_b64, audio_format = _build_tts_audio_payload(text)
     return jsonify({"ok": True, "audio_b64": audio_b64, "audio_format": audio_format})

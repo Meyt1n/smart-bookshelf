@@ -53,10 +53,23 @@ bookshelf/
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
-| `YOLO_OCR_CONF` | `0.25` | YOLO 置信度阈值 |
+| `YOLO_OCR_CONF` | `0.15` | YOLO 置信度阈值 |
 | `YOLO_OCR_IOU` | `0.7` | YOLO NMS IoU |
 | `YOLO_OCR_MAX_DET` | `20` | 单张图最大检测框数 |
 | `YOLO_OCR_PADDING_RATIO` | `0.04` | OCR 裁剪 ROI 时的边距比例 |
+
+## 语音模型
+
+语音相关的大模型和本地运行时不随仓库提交，按需放在本地路径或用环境变量指定：
+
+| 用途 | 默认本地路径 | 环境变量覆盖 |
+| --- | --- | --- |
+| Vosk 中文 ASR 模型 | `models/vosk-cn` | `VOSK_MODEL_PATH` |
+| Piper 可执行文件 | `tools/piper/piper/piper.exe` | `PIPER_BIN` |
+| Piper 中文 TTS 模型 | `tools/piper/models/zh_CN-huayan-medium.onnx` | `PIPER_MODEL` |
+| Piper TTS 配置 | `tools/piper/models/zh_CN-huayan-medium.onnx.json` | `PIPER_CONFIG` |
+
+如果这些本地模型不存在，对应的离线 ASR / Piper TTS 能力会不可用；Edge TTS 或系统 TTS 仍可按当前环境继续尝试。
 
 ## 安装
 
@@ -108,8 +121,13 @@ python app.py
 | --- | --- | --- |
 | `VOICE_MODE` | `auto` | 语音模式分发 |
 | `VOICE_MODEL_DISPATCH` | `0` | 是否启用模型分发 |
+| `VOSK_MODEL_PATH` | `models/vosk-cn` | Vosk 离线语音识别模型目录 |
+| `PIPER_BIN` | 自动查找 | Piper 可执行文件路径 |
+| `PIPER_MODEL` | 自动查找 | Piper `.onnx` 语音模型路径 |
+| `PIPER_CONFIG` | 自动查找 | Piper 模型 `.json` 配置路径 |
 | `ENABLE_WAKE_LISTEN` | 未启用 | 是否启动后台唤醒监听线程 |
 | `WAKE_DEBUG_LOG` | `0` | 是否输出唤醒调试日志 |
+| `CAMERA_SOURCE` | `http://10.165.117.25:8080` | 后端摄像头来源，数字表示本机摄像头编号，HTTP 根地址会自动尝试 `/video` |
 | `PADDLEOCR_SHOW_LOG` | `0` | 是否显示 PaddleOCR 日志 |
 | `PUBLIC_BASE_URL` | 空 | 对外访问基础地址 |
 | `PI_BRIDGE_BASE_URL` | `http://127.0.0.1:8765` | 树莓派桥接服务地址 |
@@ -175,8 +193,9 @@ python app.py
 ## 数据与模型提交策略
 
 - `YOLO_model/*.pt` 会提交到仓库，便于 clone 后直接运行 ROI 检测。
+- `models/`、`tools/piper/models/`、`tools/piper/piper/` 和 `tools/piper/*.zip` 不提交到仓库，用于放置本地 Vosk / Piper 语音模型与运行时。
 - `data/*.db` 不提交到仓库，避免把本地业务数据上传到 GitHub。
-- `.wake.lock`、`__pycache__`、临时文件和大体积运行产物不提交。
+- `.wake.lock`、`__pycache__`、`_ppt_slide_exports/`、临时文件和大体积运行产物不提交。
 
 ## 调试建议
 

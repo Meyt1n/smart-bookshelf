@@ -79,6 +79,44 @@ class MotionPrepareCommitTests(unittest.TestCase):
             raise AssertionError("Seed database has no books")
         return row[0]
 
+    def _ensure_stored_book(self):
+        conn = sqlite3.connect(self.db_path)
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT c.compartment_id, b.title
+            FROM compartments c
+            JOIN stored_books s ON s.compartment_id = c.compartment_id
+            JOIN books b ON b.id = s.book_id
+            ORDER BY c.compartment_id
+            LIMIT 1
+            """
+        )
+        row = cur.fetchone()
+        if row:
+            conn.close()
+            return int(row[0]), row[1]
+
+        cur.execute("SELECT id, title FROM books ORDER BY id LIMIT 1")
+        book_row = cur.fetchone()
+        if not book_row:
+            conn.close()
+            raise AssertionError("Seed database has no books")
+
+        cur.execute("SELECT compartment_id FROM compartments ORDER BY compartment_id LIMIT 1")
+        compartment_row = cur.fetchone()
+        if not compartment_row:
+            conn.close()
+            raise AssertionError("Seed database has no compartments")
+
+        book_id, title = int(book_row[0]), book_row[1]
+        cid = int(compartment_row[0])
+        cur.execute("INSERT INTO stored_books (compartment_id, book_id) VALUES (?, ?)", (cid, book_id))
+        cur.execute("UPDATE compartments SET status = 'occupied' WHERE compartment_id = ?", (cid,))
+        conn.commit()
+        conn.close()
+        return cid, title
+
     def test_store_prepare_then_commit(self):
         title = self._first_book_title()
 
@@ -102,24 +140,7 @@ class MotionPrepareCommitTests(unittest.TestCase):
         self.assertEqual(self.shelf_ops.get_book_in_compartment(cid), title)
 
     def test_take_prepare_then_commit(self):
-        conn = sqlite3.connect(self.db_path)
-        cur = conn.cursor()
-        cur.execute(
-            """
-            SELECT c.compartment_id, b.title
-            FROM compartments c
-            JOIN stored_books s ON s.compartment_id = c.compartment_id
-            JOIN books b ON b.id = s.book_id
-            ORDER BY c.compartment_id
-            LIMIT 1
-            """
-        )
-        row = cur.fetchone()
-        conn.close()
-        if not row:
-            raise AssertionError("Seed database has no stored books to take")
-
-        cid, title = int(row[0]), row[1]
+        cid, title = self._ensure_stored_book()
         prepared = self.shelf_service.take_by_cid(cid, title=title)
         self.assertTrue(prepared.ok)
         self.assertEqual(prepared.intent, "take")

@@ -41,7 +41,8 @@ BOOK_SPINE_YOLO_MODEL = os.getenv(
     "BOOK_SPINE_YOLO_MODEL",
     os.path.join(BASE_DIR, "YOLO_model", "book_spine.pt"),
 ).strip()
-YOLO_OCR_CONF = _env_float("YOLO_OCR_CONF", 0.25)
+CAMERA_SOURCE = os.getenv("CAMERA_SOURCE", "http://10.165.117.25:8080").strip()
+YOLO_OCR_CONF = _env_float("YOLO_OCR_CONF", 0.15)
 YOLO_OCR_IOU = _env_float("YOLO_OCR_IOU", 0.7)
 YOLO_OCR_MAX_DET = _env_int("YOLO_OCR_MAX_DET", 20)
 YOLO_OCR_PADDING_RATIO = _env_float("YOLO_OCR_PADDING_RATIO", 0.04)

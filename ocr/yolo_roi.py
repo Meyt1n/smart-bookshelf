@@ -10,6 +10,10 @@ import numpy as np
 import config
 
 
+_DLL_DIRECTORY_HANDLES = []
+_DLL_DIRECTORY_PATHS = set()
+
+
 @dataclass(frozen=True)
 class RoiBox:
     x1: int
@@ -39,6 +43,23 @@ def _model_path(mode: str) -> str:
 def _load_model(model_path: str):
     if not model_path or not os.path.exists(model_path):
         raise FileNotFoundError(f"YOLO model not found: {model_path}")
+
+    os.environ.setdefault("YOLO_CONFIG_DIR", config.BASE_DIR)
+
+    if os.name == "nt":
+        import site
+
+        bases = list(site.getsitepackages())
+        user_site = site.getusersitepackages()
+        if user_site:
+            bases.append(user_site)
+
+        for base in bases:
+            torch_lib = os.path.join(base, "torch", "lib")
+            torch_lib = os.path.abspath(torch_lib)
+            if os.path.isdir(torch_lib) and torch_lib not in _DLL_DIRECTORY_PATHS:
+                _DLL_DIRECTORY_HANDLES.append(os.add_dll_directory(torch_lib))
+                _DLL_DIRECTORY_PATHS.add(torch_lib)
 
     from ultralytics import YOLO
 

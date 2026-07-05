@@ -3,6 +3,11 @@ const logBox = getById("log_box");
 const chatBox = getById("chat_box");
 const chatScrollContainer = chatBox ? chatBox.parentElement : null;
 const activeAudioPlayers = new Set();
+const SHELF_AUTO_REFRESH_MS = 2000;
+const SHELF_WATCH_LOCAL_DUPLICATE_MS = 6000;
+let _shelfRefreshInFlight = false;
+let _shelfSignature = "";
+const _localShelfEventSuppressions = new Map();
 
 // 今日操作计数（声明在顶部，供 log() 使用）
 let _todayOps = Number(sessionStorage.getItem("_todayOps") || "0");
@@ -263,7 +268,7 @@ async function fetchJsonEnvelope(url, options) {
     const response = await fetch(url, options);
     return readJsonEnvelope(response);
   } catch (error) {
-    const detail = error && error.message ? error.message : "network error";
+    const detail = normalizeErrorMessage(error, "network error");
     throw new Error(`接口无法连接: ${url} (${detail})`);
   }
 }
@@ -277,6 +282,22 @@ function requireEnvelopeSuccess(envelope, fallbackMessage) {
     data: envelope.data,
     message: envelope.message || "",
   };
+}
+
+function normalizeErrorMessage(error, fallback = "未知错误") {
+  if (typeof error === "string" && error.trim()) {
+    return error.trim();
+  }
+  if (error && typeof error.message === "string" && error.message.trim()) {
+    return error.message.trim();
+  }
+  if (error != null) {
+    const rendered = String(error).trim();
+    if (rendered && rendered !== "[object Object]") {
+      return rendered;
+    }
+  }
+  return fallback;
 }
 
 async function dispatchPreparedShelfAction(prepared) {
@@ -307,6 +328,38 @@ function getReplyText(payload, fallback = "") {
   return payload?.ai_reply || payload?.reply || fallback;
 }
 
+function getShelfWatchEventText(payload) {
+  const action = payload?.intent || payload?.commit_request?.action || "";
+  if (action !== "store" && action !== "take") return "";
+  const picked = payload?.picked || {};
+  const title = picked.title || payload?.commit_request?.title || "";
+  const cid = picked.cid ?? payload?.commit_request?.cid;
+  if (!title) return "";
+  const actionText = action === "store" ? "已存入" : "已取出";
+  const suffix = cid != null ? `（${cid}号格）` : "";
+  return `${actionText}《${title}》${suffix}`;
+}
+
+function rememberLocalShelfWatchEvent(payload) {
+  const text = getShelfWatchEventText(payload);
+  if (!text) return;
+  _localShelfEventSuppressions.set(text, Date.now() + SHELF_WATCH_LOCAL_DUPLICATE_MS);
+}
+
+function shouldSuppressShelfWatchEvent(ev) {
+  const now = Date.now();
+  for (const [text, expiresAt] of _localShelfEventSuppressions) {
+    if (expiresAt <= now) {
+      _localShelfEventSuppressions.delete(text);
+    }
+  }
+  const text = String(ev?.op_text || ev?.text || "");
+  const expiresAt = _localShelfEventSuppressions.get(text);
+  if (!expiresAt || expiresAt <= now) return false;
+  _localShelfEventSuppressions.delete(text);
+  return true;
+}
+
 async function playTtsReply(text) {
   const reply = String(text || "").trim();
   if (!reply) return;
@@ -329,12 +382,57 @@ async function playTtsReply(text) {
   return false;
 }
 
-async function loadShelf() {
+async function refreshShelfViewsAfterMutation() {
+  await loadShelf({ fresh: true });
+  Promise.resolve(loadAiInsight({ fresh: true })).catch((error) => {
+    console.warn("AI insight refresh after mutation failed:", error);
+  });
+}
+
+async function finalizeShelfAction(prepared, options = {}) {
+  const {
+    fallbackReply = "",
+    fallbackLog = "操作完成",
+    wantAudio = true,
+    showChat = true,
+  } = options;
+  const { result: committed, message } = await dispatchPreparedShelfAction(prepared);
+  const resolved = { ...(prepared || {}), ...(committed || {}) };
+  rememberLocalShelfWatchEvent(resolved);
+  const reply = getReplyText(committed, getReplyText(prepared, fallbackReply));
+
+  log(message || resolved.msg || fallbackLog);
+  await refreshShelfViewsAfterMutation();
+
+  if (reply && showChat) {
+    chat(TXT.bot, reply);
+  }
+  if (reply && wantAudio) {
+    await playTtsReply(reply);
+  }
+
+  return {
+    result: resolved,
+    message,
+    reply,
+  };
+}
+
+async function loadShelf(options = {}) {
   const grid = getById("shelf_grid");
   try {
-    const envelope = await fetchJsonEnvelope("/api/compartments");
+    const url = options?.fresh ? `/api/compartments?t=${Date.now()}` : "/api/compartments";
+    const envelope = await fetchJsonEnvelope(url, { cache: "no-store" });
     const { data } = requireEnvelopeSuccess(envelope, "书架加载失败");
     const compartments = Array.isArray(data) ? data : [];
+    const nextSignature = JSON.stringify(
+      compartments.map((it) => [it.cid, it.status, it.book || ""])
+    );
+    if (options?.silent && _shelfSignature && nextSignature === _shelfSignature) {
+      return false;
+    }
+    _shelfSignature = nextSignature;
+
     grid.innerHTML = "";
     let used = 0;
 
@@ -379,16 +477,42 @@ async function loadShelf() {
     const statFree  = getById("stat-free");  if (statFree)  statFree.textContent  = free;
     // 缓存供弹窗使用
     window._shelfData = compartments;
+    return true;
   } catch (e) {
-    grid.innerHTML = `<div class="error-placeholder">\u52a0\u8f7d\u5931\u8d25: ${e.message}</div>`;
+    if (!options?.silent) {
+      grid.innerHTML = `<div class="error-placeholder">\u52a0\u8f7d\u5931\u8d25: ${e.message}</div>`;
+    }
+    return false;
   }
 }
 
-async function loadAiInsight() {
+async function refreshShelfIfChanged() {
+  if (_shelfRefreshInFlight || document.hidden) return;
+  _shelfRefreshInFlight = true;
+  try {
+    await loadShelf({ fresh: true, silent: true });
+  } finally {
+    _shelfRefreshInFlight = false;
+  }
+}
+
+function startShelfAutoRefresh() {
+  window.setInterval(refreshShelfIfChanged, SHELF_AUTO_REFRESH_MS);
+  window.addEventListener("focus", refreshShelfIfChanged);
+  window.addEventListener("pageshow", refreshShelfIfChanged);
+  document.addEventListener("visibilitychange", () => {
+    if (!document.hidden) {
+      refreshShelfIfChanged();
+    }
+  });
+}
+
+async function loadAiInsight(options = {}) {
   const box = getById("ai_insight_box");
   if (!box) return;
   try {
-    const envelope = await fetchJsonEnvelope("/api/ai_insight");
+    const url = options?.fresh ? `/api/ai_insight?t=${Date.now()}` : "/api/ai_insight";
+    const envelope = await fetchJsonEnvelope(url, { cache: "no-store" });
     const { data } = requireEnvelopeSuccess(envelope, "AI insight 加载失败");
     box.innerHTML = data?.insight || "";
   } catch (_) {
@@ -410,11 +534,6 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
   }
   log(scanSpine ? "\u51c6\u5907\u6253\u5f00\u6444\u50cf\u5934\u8fdb\u884c\u4e66\u810a\u5b58\u4e66\u626b\u63cf..." : "\u51c6\u5907\u6253\u5f00\u6444\u50cf\u5934\u8fdb\u884c\u5c01\u9762\u5b58\u4e66\u626b\u63cf...");
 
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    log("\u5f53\u524d\u6d4f\u89c8\u5668\u4e0d\u652f\u6301\u6444\u50cf\u5934\u8bbf\u95ee");
-    return;
-  }
-
   const btnStore = getById("btn-store");
   const oldBtn = btnStore ? btnStore.innerHTML : "";
   if (btnStore) {
@@ -425,6 +544,35 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
   let stream = null;
   let capturedBlob = null;
   let preparedFromScan = null;
+
+  const openBrowserCamera = async (video) => {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      throw new Error("当前浏览器不支持摄像头访问，请使用支持摄像头的浏览器。");
+    }
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: "environment" } },
+      audio: false,
+    });
+    video.srcObject = stream;
+    video.muted = true;
+    video.playsInline = true;
+    await video.play();
+    await new Promise((resolve) => setTimeout(resolve, 600));
+  };
+
+  const captureBrowserCameraFrame = async () => {
+    const video = document.createElement("video");
+    video.autoplay = true;
+    await openBrowserCamera(video);
+    const width = video.videoWidth || 1280;
+    const height = video.videoHeight || 720;
+    const canvas = document.createElement("canvas");
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext("2d");
+    ctx.drawImage(video, 0, 0, width, height);
+    return new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+  };
 
   const buildOcrParams = () => {
     const params = new URLSearchParams({ source });
@@ -445,19 +593,7 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
   try {
     if (typeof Swal === "undefined") {
       // Fallback: no modal, auto-capture a frame.
-      stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
-      const video = document.createElement("video");
-      video.autoplay = true;
-      video.playsInline = true;
-      video.srcObject = stream;
-      await video.play();
-      await new Promise((r) => setTimeout(r, 800));
-      const canvas = document.createElement("canvas");
-      canvas.width = video.videoWidth || 1280;
-      canvas.height = video.videoHeight || 720;
-      const ctx = canvas.getContext("2d");
-      ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
-      capturedBlob = await new Promise((resolve) => canvas.toBlob(resolve, "image/jpeg", 0.92));
+      capturedBlob = await captureBrowserCameraFrame();
     } else {
     const autoCapture = () =>
       new Promise((resolve) => {
@@ -483,7 +619,7 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
           html: `
             <div style="display:flex;flex-direction:column;gap:10px;align-items:center;">
               <div style="position:relative;width:100%;max-width:420px;aspect-ratio:16/9;">
-                <video id="camera_stream" autoplay playsinline style="width:100%;height:100%;object-fit:fill;border-radius:12px;border:1px solid #ddd;"></video>
+                <video id="camera_stream" autoplay playsinline muted style="width:100%;height:100%;object-fit:fill;border-radius:12px;border:1px solid #ddd;"></video>
                 <canvas id="yolo_roi_overlay" style="position:absolute;inset:0;width:100%;height:100%;pointer-events:none;"></canvas>
               </div>
               <div id="yolo_roi_status" style="font-size:12px;color:#8e735b;">YOLO \u6b63\u5728\u5b9a\u4f4d ROI...</div>
@@ -495,14 +631,19 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
           cancelButtonText: "\u53d6\u6d88",
           background: "#fefae0",
           didOpen: async () => {
-            stream = await navigator.mediaDevices.getUserMedia({ video: true, audio: false });
             const video = document.getElementById("camera_stream");
-            if (video) {
-              video.srcObject = stream;
-              await video.play();
-            }
             const overlay = document.getElementById("yolo_roi_overlay");
             const roiStatus = document.getElementById("yolo_roi_status");
+            try {
+              if (video) {
+                await openBrowserCamera(video);
+              }
+            } catch (error) {
+              if (roiStatus) {
+                roiStatus.textContent = error?.message || "浏览器摄像头打开失败";
+              }
+              return;
+            }
 
             const width = 640;
             const height = 360;
@@ -622,7 +763,10 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
                 clearInterval(scanTimer);
                 return;
               }
-              if (!video || video.readyState < 2) return;
+              const cameraReady = video instanceof HTMLVideoElement
+                ? video.readyState >= 2
+                : Boolean(video?.naturalWidth > 0);
+              if (!video || !cameraReady) return;
               ctx.drawImage(video, 0, 0, width, height);
               const now = Date.now();
               if (now - lastRoiAt >= 700) {
@@ -640,6 +784,11 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
             if (scanTimer) {
               clearInterval(scanTimer);
             }
+            const camera = document.getElementById("camera_stream");
+            if (camera) {
+              camera.srcObject = null;
+              camera.removeAttribute("src");
+            }
             if (stream) {
               stream.getTracks().forEach((t) => t.stop());
             }
@@ -655,14 +804,11 @@ async function storeByOcr(fromText, isAudio = false, opts = {}) {
     }
 
     const prepared = preparedFromScan || await ingestCaptureBlob(capturedBlob);
-    const { result: committed, message } = await dispatchPreparedShelfAction(prepared);
-
-    log(message || "存书完成");
-    const storeReply = getReplyText(committed, getReplyText(prepared, "好的，已完成存书。"));
-    chat(TXT.bot, storeReply);
-    await playTtsReply(storeReply);
-    await loadShelf();
-    await loadAiInsight();
+    await finalizeShelfAction(prepared, {
+      fallbackReply: "好的，已完成存书。",
+      fallbackLog: "存书完成",
+      wantAudio: true,
+    });
   } catch (e) {
     log(`\u5b58\u4e66\u5931\u8d25: ${e.message}`);
     if (typeof Swal !== "undefined") {
@@ -711,16 +857,11 @@ async function takeBook(cid, title) {
     });
     const { data } = requireEnvelopeSuccess(envelope, "\u53d6\u4e66\u5931\u8d25");
     const prepared = data || {};
-    const { result: committed, message } = await dispatchPreparedShelfAction(prepared);
-    const reply = getReplyText(committed, getReplyText(prepared, `已为你取出《${title}》`));
-
-    log(message || "\u53d6\u4e66\u5b8c\u6210");
-    if (reply) {
-      chat(TXT.bot, reply);
-      await playTtsReply(reply);
-    }
-    await loadShelf();
-    await loadAiInsight();
+    await finalizeShelfAction(prepared, {
+      fallbackReply: `已为你取出《${title}》`,
+      fallbackLog: "\u53d6\u4e66\u5b8c\u6210",
+      wantAudio: true,
+    });
   } catch (e) {
     log(`\u53d6\u4e66\u5931\u8d25: ${e.message}`);
   }
@@ -740,24 +881,11 @@ async function takeByTextIntent(text, isAudio = false, opts = {}) {
     });
     const { data } = requireEnvelopeSuccess(envelope, "\u53d6\u4e66\u5931\u8d25");
     const prepared = data || {};
-    const { result: committed, message } = await dispatchPreparedShelfAction(prepared);
-    const reply = getReplyText(
-      committed,
-      getReplyText(
-        prepared,
-        prepared?.picked ? `已为你取出《${prepared.picked.title}》` : "已执行取书指令"
-      )
-    );
-
-    log(message || "\u53d6\u4e66\u5b8c\u6210");
-    if (reply) {
-      chat(TXT.bot, reply);
-    }
-    if (wantAudio) {
-      await playTtsReply(reply);
-    }
-    await loadShelf();
-    await loadAiInsight();
+    await finalizeShelfAction(prepared, {
+      fallbackReply: prepared?.picked ? `已为你取出《${prepared.picked.title}》` : "已执行取书指令",
+      fallbackLog: "\u53d6\u4e66\u5b8c\u6210",
+      wantAudio,
+    });
   } catch (e) {
     log(e.message || "\u53d6\u4e66\u6307\u4ee4\u6267\u884c\u5931\u8d25");
   }
@@ -976,7 +1104,7 @@ async function startMicLoop() {
       const mode = isWakeActive() ? "command" : "wake";
       // 把当前书架书名传给后端，辅助ASR识别
       try {
-        const shelfEnvelope = await fetchJsonEnvelope("/api/compartments");
+        const shelfEnvelope = await fetchJsonEnvelope(`/api/compartments?t=${Date.now()}`, { cache: "no-store" });
         const { data: shelfData } = requireEnvelopeSuccess(shelfEnvelope, "书架加载失败");
         const titles = (Array.isArray(shelfData) ? shelfData : []).filter(i => i.book).map(i => i.book).join(",");
         if (titles) form.append("hints_extra", titles);
@@ -1024,13 +1152,18 @@ async function startMicLoop() {
       }
       let resolvedResult = result;
       let operationMessage = envelope.message || "";
-      let shouldRefreshShelf = false;
 
       if (result.dispatch_request && result.commit_request) {
-        const committed = await dispatchPreparedShelfAction(result);
-        resolvedResult = { ...result, ...(committed.result || {}) };
-        operationMessage = committed.message || operationMessage;
-        shouldRefreshShelf = true;
+        const finalized = await finalizeShelfAction(result, {
+          fallbackReply: getReplyText(result, ""),
+          fallbackLog: operationMessage || "操作完成",
+          wantAudio: true,
+        });
+        resolvedResult = finalized.result;
+        if (resolvedResult.intent && resolvedResult.intent !== "wake") {
+          setWakeActive();
+        }
+        return;
       }
 
       // msg 是操作结果（存书/取书），进操作日志
@@ -1066,13 +1199,13 @@ async function startMicLoop() {
       if (resolvedResult.intent && resolvedResult.intent !== "wake") {
         setWakeActive();
         // 语音指令执行后立刻刷新书架
-        if (shouldRefreshShelf || resolvedResult.intent === "store" || resolvedResult.intent === "take") {
-          await loadShelf();
-          await loadAiInsight();
+        if (resolvedResult.intent === "store" || resolvedResult.intent === "take") {
+          await refreshShelfViewsAfterMutation();
         }
       }
     } catch (e) {
-      log(`语音上传失败: ${e.message}`);
+      console.error("Voice upload failed:", e);
+      log(`语音上传失败: ${normalizeErrorMessage(e)}`);
     } finally {
       micSending = false;
       flushing = false;
@@ -1189,6 +1322,7 @@ if (micBtn) {
 }
 
 loadShelf();
+startShelfAutoRefresh();
 loadAiInsight();
 loadClimate();
 setInterval(loadClimate, 300000);
@@ -1209,16 +1343,26 @@ function connectVoiceStream() {
     } else if (ev.role === "user") {
       chat(TXT.userVoice, ev.text, true);
     } else if (ev.role === "assistant") {
+      const isShelfWatchEvent = ev.source === "shelf_watch";
+      const shouldSuppressShelfWatch = isShelfWatchEvent && shouldSuppressShelfWatchEvent(ev);
       const isOpResult = /已为你取出|已存入|存入|取出|书柜里没有|书柜已满/.test(ev.text);
-      if (isOpResult) {
-        log(ev.text);
-      } else {
-        chat(TXT.bot, ev.text);
+      const shouldRefreshShelf = isShelfWatchEvent || isOpResult;
+      const replyText = String(ev.text || "").trim();
+
+      if (shouldSuppressShelfWatch) {
+        await refreshShelfViewsAfterMutation();
+        return;
       }
-      // 有操作结果就刷新书架
-      if (isOpResult) {
-        await loadShelf();
-        await loadAiInsight();
+
+      if (replyText) {
+        chat(TXT.bot, replyText);
+      }
+      if (shouldRefreshShelf) {
+        log(ev.op_text || replyText);
+        await refreshShelfViewsAfterMutation();
+        if (isShelfWatchEvent && replyText && replyText !== ev.op_text) {
+          await playTtsReply(replyText);
+        }
       }
     }
   };

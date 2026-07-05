@@ -5,13 +5,22 @@
 *.zip
 *.db
 *.lock
+*.ort
 
 # 排除 IDE 缓存
 .idea/
 .vscode/
 AppData/
+Ultralytics/
 venv/
 *.pyc
+
+# 排除本地语音模型、Piper 运行时和导出产物
+models/
+tools/piper/models/
+tools/piper/piper/
+tools/piper/*.zip
+_ppt_slide_exports/
 
 # 排除 Piper 的数据目录
 tools/piper/piper/espeak-ng-data/
